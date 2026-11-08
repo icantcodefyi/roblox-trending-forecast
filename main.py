@@ -46,14 +46,6 @@ DEFAULTS = {
     "surge_to": 17.8,  # ... to this many
     "surge_clip": 2.5,  # largest surge counted, either way
     "momentum_top_mult": 0.4,  # momentum multiplier for games now in the top 10 (their moves barely trend)
-    "momentum_down_mult": 1.0,  # momentum multiplier for falling games
-    "surge_top_mult": 1.0,  # surge multiplier for games now in the top 10
-    "momentum2": 0.0,  # a second, short-window velocity's share
-    "vel_window2": 12.0,  # hours it is measured over
-    "sigma_rank_pow": 0.0,  # the spread scales with (rank / 5) ** this
-    "vol_alpha": 0.0,  # the spread scales with (realized volatility / vol_ref) ** this, between 0.6x and 1.8x
-    "vol_ref": 0.07,  # the archive's typical realized volatility (log rank per sqrt hour, top 20)
-    "vol_window": 72.0,  # hours of history the realized volatility is measured over
     "tpn_max": 3,  # at most this many surging Top Playing Now games named as likely newcomers (0: none)
     "tpn_rank_max": 20,  # only from the list's top this many
     "tpn_surge_min": 1.0,  # and only with at least this player surge (log ratio, list-median relative)
@@ -272,30 +264,6 @@ def kernel_matrix(reads, chart, hours, prm):
     return acc, ent
 
 
-def realized_vol(reads, prm):
-    """The chart's recent volatility: mean |change of log rank| per sqrt(hour) of the top 20 games, over pairs of
-    reads 3 to 12 hours apart within vol_window hours of the last read (None when no such pair)."""
-    last_t = reads[-1]["t"]
-    recent = [r for r in reads if last_t - r["t"] <= prm["vol_window"] * 3600.0]
-    total, count = 0.0, 0
-    for i, a in enumerate(recent):
-        pos_a = None
-        for b in recent[i + 1:]:
-            gap = (b["t"] - a["t"]) / 3600.0
-            if gap < 3.0:
-                continue
-            if gap > 12.0:
-                break
-            if pos_a is None:
-                pos_a = {u: k + 1 for k, u in enumerate(a["order"][:20])}
-            pos_b = {u: k + 1 for k, u in enumerate(b["order"])}
-            n_b = len(b["order"])
-            d = sum(abs(math.log(pos_b.get(u, n_b + 1)) - math.log(ra)) for u, ra in pos_a.items()) / max(len(pos_a), 1)
-            total += d / math.sqrt(gap)
-            count += 1
-    return total / count if count else None
-
-
 def exit_hazard(rank, prm):
     if rank <= 10:
         return prm["exit_top"]
@@ -304,7 +272,7 @@ def exit_hazard(rank, prm):
     return prm["exit_low"]
 
 
-def slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands=()):
+def slot_matrix(chart, vel, surge, h, prm, cands=()):
     """Games x places 1..C probabilities at horizon h hours (C = matrix_places), balanced by Sinkhorn.
 
     Column C+1 holds everything else: a rank below C or off the chart. Each game's row sums to 1; place k's column
@@ -313,7 +281,8 @@ def slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands=()):
     n = len(chart)
     cols = min(n, int(prm["matrix_places"]))
     bounds = [math.log(k + 0.5) for k in range(1, cols + 1)]
-    sig_h = math.sqrt(prm["sigma0"] ** 2 + prm["sigma1"] ** 2 * h) * vol_mult
+    sig = math.sqrt(prm["sigma0"] ** 2 + prm["sigma1"] ** 2 * h)
+    sig_w = sig * prm["tail_mult"]
     tw = prm["tail_w"]
     tau = prm["momentum_tau"]
     drift_h = tau * (1.0 - math.exp(-h / tau)) if tau > 0 else h
@@ -322,11 +291,8 @@ def slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands=()):
     for i, u in enumerate(chart):
         rank = i + 1
         s = max(-prm["surge_clip"], min(prm["surge_clip"], surge[u]))
-        mom = prm["momentum"] * (prm["momentum_top_mult"] if rank <= 10 else 1.0) * (prm["momentum_down_mult"] if vel[u] > 0 else 1.0)
-        sc = prm["surge_coef"] * (prm["surge_top_mult"] if rank <= 10 else 1.0)
-        mu = math.log(rank) + (mom * vel[u] + prm["momentum2"] * vel2[u]) * drift_h - sc * s * surge_h
-        sig = sig_h * (rank / 5.0) ** prm["sigma_rank_pow"]
-        sig_w = sig * prm["tail_mult"]
+        mom = prm["momentum"] * (prm["momentum_top_mult"] if rank <= 10 else 1.0)
+        mu = math.log(rank) + mom * vel[u] * drift_h - prm["surge_coef"] * s * surge_h
         stay = math.exp(-exit_hazard(rank, prm) * h)
         prev = 0.0
         row = []
@@ -386,14 +352,7 @@ def forecast(reads, task, prm=None):
     chart = last["order"]
     pos_list = positions(reads, last["t"] - prm["vel_window"] * 3600.0)
     vel = {u: velocity(pos_list, u, prm) for u in chart}
-    pos_list2 = positions(reads, last["t"] - prm["vel_window2"] * 3600.0)
-    vel2 = {u: velocity(pos_list2, u, prm) for u in chart} if prm["momentum2"] else {u: 0.0 for u in chart}
     surge = player_surge(reads, prm)
-    vol_mult = 1.0
-    if prm["vol_alpha"]:
-        rv = realized_vol(reads, prm)
-        if rv:
-            vol_mult = min(max((rv / prm["vol_ref"]) ** prm["vol_alpha"], 0.6), 1.8)
     cands = tpn_candidates(reads, prm)
     games = list(chart) + [u for u, _ in cands]
     acc = [[0.0] * places for _ in games]
@@ -402,7 +361,7 @@ def forecast(reads, task, prm=None):
     for s in range(slots):
         h = max((t0 + s * slot_s + 120.0 - last["t"]) / 3600.0, 0.05)
         hours.append(h)
-        m, ent = slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands)
+        m, ent = slot_matrix(chart, vel, surge, h, prm, cands)
         for g in range(len(games)):
             for k in range(min(places, len(m[g]))):
                 acc[g][k] += m[g][k] / slots
