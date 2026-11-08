@@ -32,7 +32,7 @@ DEFAULTS = {
     "vel_prior_n": 0.135,  # shrinkage of the velocity toward 0 (pseudo-reads)
     "sigma0": 0.0067,  # log-rank spread at horizon 0
     "sigma1": 0.065,  # log-rank spread growth per sqrt(hour)
-    "tail_w": 0.136,  # weight of the wide component
+    "tail_w": 0.11,  # weight of the wide component
     "tail_mult": 3.0,  # the wide component's spread, as a multiple
     "exit_top": 0.003,  # per-hour hazard of leaving the chart, ranks 1-10
     "exit_mid": 0.048,  # ranks 11-40
@@ -40,7 +40,7 @@ DEFAULTS = {
     "entrant_rate": 0.0015,  # per-hour growth of a top-10 place's mass for games new to the chart
     "entrant_cap": 0.12,  # most of a place's mass left to new games
     "entrant_slope": 0.0,  # places further down get more: mass * (k / 5.5) ** slope
-    "surge_coef": 0.547,  # log-rank climb per unit of player surge (log ratio), reached over surge_tau
+    "surge_coef": 0.75,  # log-rank climb per unit of player surge (log ratio), reached over surge_tau
     "surge_tau": 16.2,  # hours for a surge to show in the rank
     "surge_from": 26.5,  # the surge's reference: reads this many hours ago (about the same hour yesterday) ...
     "surge_to": 17.8,  # ... to this many
