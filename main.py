@@ -56,8 +56,8 @@ DEFAULTS = {
     "tpn_center": 3.5,  # the place it most likely enters around
     "tpn_width": 0.8,  # log-place spread of where it enters
     "freeze_w": 0.0,  # weight of the frozen-chart component (0: off)
-    "freeze_t0": 3.0,  # prior: P(still frozen after h hours) = exp(-(h / freeze_t0) ** freeze_k) ...
-    "freeze_k": 1.5,  # ... a recompute comes within a few hours, so the curve falls faster than exponential
+    "freeze_t0": 2.0,  # prior: P(still frozen after h hours) = exp(-(h / freeze_t0) ** freeze_k) ...
+    "freeze_k": 1.0,  # ... memoryless, a recompute every 2 hours or so: fits both hourly reads and the archive
     "freeze_prior_n": 6.0,  # pseudo-pairs behind that prior at each horizon
     "pool_kernel": 0.0,  # weight of the empirical transition kernel in a linear pool with the model (0: off)
     "kernel_bw": 4.0,  # hours: bandwidth matching the history's read gaps to each slot's horizon
