@@ -51,7 +51,7 @@ DEFAULTS = {
     "tpn_surge_min": 1.0,  # and only with at least this player surge (log ratio, list-median relative)
     "tpn_ref_from": 30.0,  # the surge's reference reads: from this many hours before the last read ...
     "tpn_ref_to": 4.0,  # ... to this many
-    "tpn_p": 0.25,  # chance such a game is on the chart within a day
+    "tpn_p": 0.15,  # chance such a game is on the chart within a day
     "tpn_tau": 8.0,  # hours: how fast that chance builds
     "tpn_center": 3.5,  # the place it most likely enters around
     "tpn_width": 0.8,  # log-place spread of where it enters
@@ -103,13 +103,14 @@ def load_reads(path):
                     continue
                 seen.add(u)
                 order.append(u)
-                if isinstance(p, (int, float)) and not isinstance(p, bool):
+                if isinstance(p, (int, float)) and not isinstance(p, bool) and math.isfinite(p):
                     playing[u] = float(p)
             tpn = {}
-            for r in d.get("top_playing_now") or []:
+            tpn_rows = d.get("top_playing_now")
+            for r in tpn_rows if isinstance(tpn_rows, list) else []:
                 if isinstance(r, dict):
                     u, p = r.get("universe_id"), r.get("playing")
-                    if isinstance(u, int) and not isinstance(u, bool) and u > 0 and u not in tpn and isinstance(p, (int, float)) and not isinstance(p, bool) and p > 0:
+                    if isinstance(u, int) and not isinstance(u, bool) and u > 0 and u not in tpn and isinstance(p, (int, float)) and not isinstance(p, bool) and math.isfinite(p) and p > 0:
                         tpn[u] = float(p)
             if order:
                 reads.append({"t": t, "order": order, "playing": playing, "tpn": tpn})
@@ -176,20 +177,25 @@ def player_surge(reads, prm):
 
 
 def tpn_candidates(reads, prm):
-    """Games on the last read's Top Playing Now list, not on its trending chart, whose players surged: likely to
-    enter the trending chart soon, high up. Returns [(universe_id, surge)], strongest first, at most tpn_max.
-    surge: log players relative to the list's median now, against the same over reads tpn_ref_to..tpn_ref_from
-    hours before (absent from a list: 0.8 of its last entry's players)."""
+    """Games that just broke into the last read's Top Playing Now top tpn_rank_max from below it, are not on its
+    trending chart, and whose players surged: likely to enter the trending chart soon, high up. Established hits
+    that sit in that top all along never trend (the chart ranks a relative rise), so they are left out.
+    Returns [(universe_id, surge)], strongest first, at most tpn_max. surge: log players relative to the list's
+    median now, against the same over reads tpn_ref_to..tpn_ref_from hours before (absent from a list: 0.8 of
+    its last entry's players)."""
     last = reads[-1]
     if not last.get("tpn") or prm["tpn_max"] <= 0:
         return []
+    top_n = int(prm["tpn_rank_max"])
 
     def rel_map(r):
         vals = sorted(r["tpn"].values())
         med = vals[len(vals) // 2]
-        return {u: math.log(p / med) for u, p in r["tpn"].items()}, math.log(0.8 * vals[0] / med)
+        ranked_r = sorted(r["tpn"].items(), key=lambda x: (-x[1], x[0]))
+        top = {u for u, _ in ranked_r[:top_n]}
+        return {u: math.log(p / med) for u, p in r["tpn"].items()}, math.log(0.8 * vals[0] / med), top
 
-    now, _ = rel_map(last)
+    now, _, _ = rel_map(last)
     refs = [rel_map(r) for r in reads[:-1] if r.get("tpn") and prm["tpn_ref_to"] <= (last["t"] - r["t"]) / 3600.0 <= prm["tpn_ref_from"]]
     if not refs:
         return []
@@ -197,9 +203,11 @@ def tpn_candidates(reads, prm):
     ranked = sorted(last["tpn"].items(), key=lambda x: (-x[1], x[0]))
     out = []
     for i, (u, _) in enumerate(ranked):
-        if i >= prm["tpn_rank_max"] or u in on_chart:
+        if i >= top_n or u in on_chart:
             continue
-        before = sum(m.get(u, floor) for m, floor in refs) / len(refs)
+        if any(u in top for _, _, top in refs):
+            continue  # already in that top before: an established hit, not a riser
+        before = sum(m.get(u, floor) for m, floor, _ in refs) / len(refs)
         s = now[u] - before
         if s >= prm["tpn_surge_min"]:
             out.append((u, s))
@@ -302,21 +310,20 @@ def slot_matrix(chart, vel, surge, h, prm, cands=()):
             prev = c
         row.append(max(1.0 - sum(row), 1e-12))
         rows.append(row)
-    # Surging Top Playing Now games: on the chart by now with probability q, and then high up (a log-normal
-    # profile over the places around tpn_center); the rest of their row is "not on the chart yet".
+    # Surging Top Playing Now games: fixed rows, on the chart by now with probability q and then high up (a
+    # log-normal profile over the places around tpn_center). Their mass is taken out of each place before the
+    # chart games are balanced, so a candidate holds exactly what these parameters say.
+    cand_rows = []
     if cands:
         q = prm["tpn_p"] * (1.0 - math.exp(-h / prm["tpn_tau"]))
         lc, wd = math.log(prm["tpn_center"]), prm["tpn_width"]
         prof = [math.exp(-0.5 * ((math.log(k) - lc) / wd) ** 2) for k in range(1, cols + 1)]
         sp = sum(prof)
-        for _ in cands:
-            row = [q * p / sp for p in prof]
-            row.append(max(1.0 - q, 1e-12))
-            rows.append(row)
+        cand_rows = [[q * p / sp for p in prof] for _ in cands]
     # Each place's mass for games new to the chart grows with the horizon and with the place.
     base = min(prm["entrant_rate"] * h, prm["entrant_cap"])
     ent = [min(base * ((k + 1) / 5.5) ** prm["entrant_slope"], 0.6) for k in range(cols)]
-    col_t = [1.0 - e for e in ent]
+    col_t = [max(1.0 - e - sum(cr[k] for cr in cand_rows), 0.05) for k, e in enumerate(ent)]
     col_t.append(max(len(rows) - sum(col_t), 1e-9))
     width = cols + 1
     for _ in range(int(prm["sinkhorn_iters"])):
@@ -338,6 +345,7 @@ def slot_matrix(chart, vel, surge, h, prm, cands=()):
     top = min(PLACES, cols)
     sums = [sum(row[k] for row in rows) for k in range(top)]
     out = [[row[k] * col_t[k] / sums[k] if sums[k] > 0 else 0.0 for k in range(top)] for row in rows]
+    out.extend(cr[:top] for cr in cand_rows)
     return out, ent[:top]
 
 
@@ -447,7 +455,7 @@ def main():
         task = {}
     try:
         reads = load_reads(os.path.join(in_dir, "history.ndjson"))
-    except (OSError, UnicodeDecodeError):
+    except Exception:  # noqa: BLE001 - an unreadable history still gets a valid (placeholder) forecast
         reads = []
     places = task.get("places") if isinstance(task.get("places"), int) and 1 <= task.get("places") <= PLACES else PLACES
     try:

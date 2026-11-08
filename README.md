@@ -10,11 +10,13 @@ hourly read with a log score.
 ## How it forecasts
 
 - **Per game, per hour:** each game on the last chart gets a distribution over its future rank in log-rank space. The
-  mean drifts with the game's measured momentum (a damped log-rank trend) and with its player surge (players now
-  against the same hours a day earlier, both relative to the chart's median, which takes out the daily cycle). The
-  spread grows with the horizon, with a heavy-tailed second component.
+  mean drifts with the game's measured momentum (a damped log-rank trend, weaker for games already in the top 10,
+  whose moves barely trend) and with its player surge (players now against the same hours a day earlier, both
+  relative to the chart's median, which takes out the daily cycle). The spread grows with the horizon, with a
+  heavy-tailed second component.
 - **Exits and newcomers:** each game may leave the chart (a hazard by rank band), and each place keeps some mass for
-  games that are not on the chart yet.
+  games that are not on the chart yet. A game that just broke into the Top Playing Now top 20 with a player surge,
+  while off the trending chart, is named as a likely newcomer near the top.
 - **One game per place:** the games-by-places matrix is balanced by Sinkhorn iterations, so each place holds one game
   and each game one place.
 - **One forecast for the whole window:** the hourly matrices are averaged over the 24 slots, which is the best single
