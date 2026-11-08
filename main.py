@@ -26,7 +26,7 @@ PLACES = 10
 # the last of a history, scored on the reads of the next 24 hours), then hedged toward wider tails: a forecast too
 # sharp loses far more in a day the chart moves than one too wide loses in a quiet day.
 DEFAULTS = {
-    "momentum": 0.148,  # share of the measured log-rank velocity carried forward
+    "momentum": 0.25,  # share of the measured log-rank velocity carried forward (below the top 10)
     "momentum_tau": 17.5,  # hours: the velocity decays with this time constant
     "vel_window": 65.0,  # hours of history the velocity is measured over
     "vel_prior_n": 0.135,  # shrinkage of the velocity toward 0 (pseudo-reads)
@@ -45,6 +45,9 @@ DEFAULTS = {
     "surge_from": 26.5,  # the surge's reference: reads this many hours ago (about the same hour yesterday) ...
     "surge_to": 17.8,  # ... to this many
     "surge_clip": 2.5,  # largest surge counted, either way
+    "momentum_top_mult": 0.4,  # momentum multiplier for games now in the top 10 (their moves barely trend)
+    "momentum_down_mult": 1.0,  # momentum multiplier for falling games
+    "surge_top_mult": 1.0,  # surge multiplier for games now in the top 10
     "momentum2": 0.0,  # a second, short-window velocity's share
     "vel_window2": 12.0,  # hours it is measured over
     "sigma_rank_pow": 0.0,  # the spread scales with (rank / 5) ** this
@@ -60,6 +63,10 @@ DEFAULTS = {
     "tpn_tau": 8.0,  # hours: how fast that chance builds
     "tpn_center": 3.5,  # the place it most likely enters around
     "tpn_width": 0.8,  # log-place spread of where it enters
+    "pool_kernel": 0.0,  # weight of the empirical transition kernel in a linear pool with the model (0: off)
+    "kernel_bw": 4.0,  # hours: bandwidth matching the history's read gaps to each slot's horizon
+    "kernel_span": 60,  # deepest offset below a place the kernel's prior reaches
+    "kernel_prior": 3.0,  # pseudo-pairs of the smoothing prior
     "matrix_places": 40,  # places modelled one by one; the rest of the chart and off it share one column
     "sinkhorn_iters": 20,
 }
@@ -208,6 +215,63 @@ def tpn_candidates(reads, prm):
     return out[: int(prm["tpn_max"])]
 
 
+def kernel_matrix(reads, chart, hours, prm):
+    """An empirical transition kernel from the history's own pairs of reads: for place k at a gap near h, how far
+    from k (in rank) the game there stood at the earlier read, or whether it was new to the chart. Pairs are
+    weighted by how close their gap is to each slot's horizon; offsets are smoothed with a discrete Laplace prior.
+    Returns games x places probabilities averaged over the slots, and each place's mass for new games."""
+    places = PLACES
+    bw = prm["kernel_bw"]
+    pairs = []
+    pos = [{u: i + 1 for i, u in enumerate(r["order"])} for r in reads]
+    for a in range(len(reads)):
+        for b in range(a + 1, len(reads)):
+            gap = (reads[b]["t"] - reads[a]["t"]) / 3600.0
+            if gap > max(hours) + 3 * bw:
+                break
+            if gap < 0.25:
+                continue
+            offs = []
+            for k in range(min(places, len(reads[b]["order"]))):
+                u = reads[b]["order"][k]
+                offs.append(pos[a][u] - (k + 1) if u in pos[a] else None)
+            pairs.append((gap, offs))
+    n = len(chart)
+    acc = [[0.0] * places for _ in range(n)]
+    ent = [0.0] * places
+    if not pairs:
+        return None, None
+    span = int(prm["kernel_span"])
+    prior = prm["kernel_prior"]
+    for h in hours:
+        w = [math.exp(-0.5 * ((g - h) / bw) ** 2) for g, _ in pairs]
+        for k in range(places):
+            counts = {}
+            new = 0.0
+            tot = 0.0
+            for wi, (_, offs) in zip(w, pairs):
+                if k >= len(offs) or wi < 1e-6:
+                    continue
+                d = offs[k]
+                tot += wi
+                if d is None:
+                    new += wi
+                else:
+                    counts[d] = counts.get(d, 0.0) + wi
+            # Discrete Laplace prior over offsets (scale grows with the horizon) plus a little new-game mass.
+            scale = 1.0 + 0.08 * h
+            pri = {d: math.exp(-abs(d) / scale) for d in range(-k, span + 1)}
+            sp = sum(pri.values())
+            denom = tot + prior
+            p_new = (new + prior * 0.02) / denom
+            for g, u in enumerate(chart):
+                d = g - k
+                c = counts.get(d, 0.0) + prior * 0.98 * pri.get(d, 0.0) / sp
+                acc[g][k] += c / denom / len(hours)
+            ent[k] += p_new / len(hours)
+    return acc, ent
+
+
 def realized_vol(reads, prm):
     """The chart's recent volatility: mean |change of log rank| per sqrt(hour) of the top 20 games, over pairs of
     reads 3 to 12 hours apart within vol_window hours of the last read (None when no such pair)."""
@@ -258,7 +322,9 @@ def slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands=()):
     for i, u in enumerate(chart):
         rank = i + 1
         s = max(-prm["surge_clip"], min(prm["surge_clip"], surge[u]))
-        mu = math.log(rank) + (prm["momentum"] * vel[u] + prm["momentum2"] * vel2[u]) * drift_h - prm["surge_coef"] * s * surge_h
+        mom = prm["momentum"] * (prm["momentum_top_mult"] if rank <= 10 else 1.0) * (prm["momentum_down_mult"] if vel[u] > 0 else 1.0)
+        sc = prm["surge_coef"] * (prm["surge_top_mult"] if rank <= 10 else 1.0)
+        mu = math.log(rank) + (mom * vel[u] + prm["momentum2"] * vel2[u]) * drift_h - sc * s * surge_h
         sig = sig_h * (rank / 5.0) ** prm["sigma_rank_pow"]
         sig_w = sig * prm["tail_mult"]
         stay = math.exp(-exit_hazard(rank, prm) * h)
@@ -332,14 +398,27 @@ def forecast(reads, task, prm=None):
     games = list(chart) + [u for u, _ in cands]
     acc = [[0.0] * places for _ in games]
     ent_acc = [0.0] * places
+    hours = []
     for s in range(slots):
         h = max((t0 + s * slot_s + 120.0 - last["t"]) / 3600.0, 0.05)
+        hours.append(h)
         m, ent = slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands)
         for g in range(len(games)):
             for k in range(min(places, len(m[g]))):
                 acc[g][k] += m[g][k] / slots
         for k in range(len(ent)):
             ent_acc[k] += ent[k] / slots
+    # Linear pool with the empirical kernel of the history's own moves (when it has enough pairs).
+    w = prm["pool_kernel"]
+    if w > 0 and places == PLACES:
+        kacc, _ = kernel_matrix(reads, chart, hours, prm)
+        if kacc is not None:
+            for g in range(len(chart)):
+                for k in range(places):
+                    acc[g][k] = (1 - w) * acc[g][k] + w * kacc[g][k]
+            for g in range(len(chart), len(games)):
+                for k in range(places):
+                    acc[g][k] *= 1 - w
     spare = [u for r in reversed(reads[:-1]) for u in r["order"]]
     return build_doc(games, acc, places, spare)
 
