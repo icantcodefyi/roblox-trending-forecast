@@ -56,9 +56,9 @@ DEFAULTS = {
     "tpn_center": 3.5,  # the place it most likely enters around
     "tpn_width": 0.8,  # log-place spread of where it enters
     "freeze_w": 0.0,  # weight of the frozen-chart component (0: off)
-    "freeze_prior_rate": 0.33,  # recomputes per hour before the history says otherwise (about 8 a day)
-    "freeze_prior_hours": 12.0,  # pseudo-hours of exposure behind that prior
-    "freeze_max_gap": 1.5,  # only reads at most this many hours apart tell whether a recompute happened
+    "freeze_t0": 3.0,  # prior: P(still frozen after h hours) = exp(-(h / freeze_t0) ** freeze_k) ...
+    "freeze_k": 1.5,  # ... a recompute comes within a few hours, so the curve falls faster than exponential
+    "freeze_prior_n": 6.0,  # pseudo-pairs behind that prior at each horizon
     "pool_kernel": 0.0,  # weight of the empirical transition kernel in a linear pool with the model (0: off)
     "kernel_bw": 4.0,  # hours: bandwidth matching the history's read gaps to each slot's horizon
     "kernel_span": 60,  # deepest offset below a place the kernel's prior reaches
@@ -276,18 +276,26 @@ def kernel_matrix(reads, chart, hours, prm):
     return acc, ent
 
 
-def recompute_rate(reads, prm):
-    """The chart's recompute rate per hour: between recomputes its order is frozen. Counted over consecutive reads
-    at most freeze_max_gap hours apart (a change of order is a recompute), shrunk toward freeze_prior_rate with
-    freeze_prior_hours of pseudo-exposure."""
-    changes, exposure = 0.0, 0.0
-    for a, b in zip(reads, reads[1:]):
-        gap = (b["t"] - a["t"]) / 3600.0
-        if 0.25 <= gap <= prm["freeze_max_gap"]:
-            exposure += gap
-            changes += a["order"] != b["order"]
-    ph = prm["freeze_prior_hours"]
-    return (changes + prm["freeze_prior_rate"] * ph) / (exposure + ph)
+def frozen_curve(reads, hours, prm):
+    """P(the chart's order is still exactly the last read's) at each horizon: between recomputes it is frozen.
+    Measured on the history's own pairs of reads within half an hour of each horizon (an identical order means no
+    recompute in between), shrunk toward the prior exp(-(h / freeze_t0) ** freeze_k) with freeze_prior_n
+    pseudo-pairs. A history without such pairs (reads hours apart) gets the prior alone."""
+    out = []
+    t0, kk, n0 = prm["freeze_t0"], prm["freeze_k"], prm["freeze_prior_n"]
+    for h in hours:
+        same = total = 0
+        for i, a in enumerate(reads):
+            for b in reads[i + 1:]:
+                gap = (b["t"] - a["t"]) / 3600.0
+                if gap > h + 0.5:
+                    break
+                if gap >= h - 0.5:
+                    total += 1
+                    same += a["order"] == b["order"]
+        prior = math.exp(-((h / t0) ** kk))
+        out.append((same + n0 * prior) / (total + n0))
+    return out
 
 
 def exit_hazard(rank, prm):
@@ -383,14 +391,13 @@ def forecast(reads, task, prm=None):
     games = list(chart) + [u for u, _ in cands]
     acc = [[0.0] * places for _ in games]
     ent_acc = [0.0] * places
-    hours = []
-    rate = recompute_rate(reads, prm) if prm["freeze_w"] > 0 else 0.0
+    hours = [max((t0 + s * slot_s + 120.0 - last["t"]) / 3600.0, 0.05) for s in range(slots)]
+    still = frozen_curve(reads, hours, prm) if prm["freeze_w"] > 0 else [0.0] * slots
     for s in range(slots):
-        h = max((t0 + s * slot_s + 120.0 - last["t"]) / 3600.0, 0.05)
-        hours.append(h)
+        h = hours[s]
         m, ent = slot_matrix(chart, vel, surge, h, prm, cands)
         # With probability frozen, no recompute has happened since the last read: the chart is exactly that read's.
-        frozen = prm["freeze_w"] * math.exp(-rate * h) if rate > 0 else 0.0
+        frozen = prm["freeze_w"] * still[s]
         for g in range(len(games)):
             for k in range(min(places, len(m[g]))):
                 acc[g][k] += ((1.0 - frozen) * m[g][k] + (frozen if g == k else 0.0)) / slots
