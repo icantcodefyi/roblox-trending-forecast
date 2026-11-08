@@ -45,6 +45,21 @@ DEFAULTS = {
     "surge_from": 26.5,  # the surge's reference: reads this many hours ago (about the same hour yesterday) ...
     "surge_to": 17.8,  # ... to this many
     "surge_clip": 2.5,  # largest surge counted, either way
+    "momentum2": 0.0,  # a second, short-window velocity's share
+    "vel_window2": 12.0,  # hours it is measured over
+    "sigma_rank_pow": 0.0,  # the spread scales with (rank / 5) ** this
+    "vol_alpha": 0.0,  # the spread scales with (realized volatility / vol_ref) ** this, between 0.6x and 1.8x
+    "vol_ref": 0.07,  # the archive's typical realized volatility (log rank per sqrt hour, top 20)
+    "vol_window": 72.0,  # hours of history the realized volatility is measured over
+    "tpn_max": 3,  # at most this many surging Top Playing Now games named as likely newcomers (0: none)
+    "tpn_rank_max": 20,  # only from the list's top this many
+    "tpn_surge_min": 1.0,  # and only with at least this player surge (log ratio, list-median relative)
+    "tpn_ref_from": 30.0,  # the surge's reference reads: from this many hours before the last read ...
+    "tpn_ref_to": 4.0,  # ... to this many
+    "tpn_p": 0.25,  # chance such a game is on the chart within a day
+    "tpn_tau": 8.0,  # hours: how fast that chance builds
+    "tpn_center": 3.5,  # the place it most likely enters around
+    "tpn_width": 0.8,  # log-place spread of where it enters
     "matrix_places": 40,  # places modelled one by one; the rest of the chart and off it share one column
     "sinkhorn_iters": 20,
 }
@@ -91,8 +106,14 @@ def load_reads(path):
                 order.append(u)
                 if isinstance(p, (int, float)) and not isinstance(p, bool):
                     playing[u] = float(p)
+            tpn = {}
+            for r in d.get("top_playing_now") or []:
+                if isinstance(r, dict):
+                    u, p = r.get("universe_id"), r.get("playing")
+                    if isinstance(u, int) and not isinstance(u, bool) and u > 0 and u not in tpn and isinstance(p, (int, float)) and not isinstance(p, bool) and p > 0:
+                        tpn[u] = float(p)
             if order:
-                reads.append({"t": t, "order": order, "playing": playing})
+                reads.append({"t": t, "order": order, "playing": playing, "tpn": tpn})
     reads.sort(key=lambda r: r["t"])
     return reads
 
@@ -155,6 +176,62 @@ def player_surge(reads, prm):
     return out
 
 
+def tpn_candidates(reads, prm):
+    """Games on the last read's Top Playing Now list, not on its trending chart, whose players surged: likely to
+    enter the trending chart soon, high up. Returns [(universe_id, surge)], strongest first, at most tpn_max.
+    surge: log players relative to the list's median now, against the same over reads tpn_ref_to..tpn_ref_from
+    hours before (absent from a list: 0.8 of its last entry's players)."""
+    last = reads[-1]
+    if not last.get("tpn") or prm["tpn_max"] <= 0:
+        return []
+
+    def rel_map(r):
+        vals = sorted(r["tpn"].values())
+        med = vals[len(vals) // 2]
+        return {u: math.log(p / med) for u, p in r["tpn"].items()}, math.log(0.8 * vals[0] / med)
+
+    now, _ = rel_map(last)
+    refs = [rel_map(r) for r in reads[:-1] if r.get("tpn") and prm["tpn_ref_to"] <= (last["t"] - r["t"]) / 3600.0 <= prm["tpn_ref_from"]]
+    if not refs:
+        return []
+    on_chart = set(last["order"])
+    ranked = sorted(last["tpn"].items(), key=lambda x: (-x[1], x[0]))
+    out = []
+    for i, (u, _) in enumerate(ranked):
+        if i >= prm["tpn_rank_max"] or u in on_chart:
+            continue
+        before = sum(m.get(u, floor) for m, floor in refs) / len(refs)
+        s = now[u] - before
+        if s >= prm["tpn_surge_min"]:
+            out.append((u, s))
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out[: int(prm["tpn_max"])]
+
+
+def realized_vol(reads, prm):
+    """The chart's recent volatility: mean |change of log rank| per sqrt(hour) of the top 20 games, over pairs of
+    reads 3 to 12 hours apart within vol_window hours of the last read (None when no such pair)."""
+    last_t = reads[-1]["t"]
+    recent = [r for r in reads if last_t - r["t"] <= prm["vol_window"] * 3600.0]
+    total, count = 0.0, 0
+    for i, a in enumerate(recent):
+        pos_a = None
+        for b in recent[i + 1:]:
+            gap = (b["t"] - a["t"]) / 3600.0
+            if gap < 3.0:
+                continue
+            if gap > 12.0:
+                break
+            if pos_a is None:
+                pos_a = {u: k + 1 for k, u in enumerate(a["order"][:20])}
+            pos_b = {u: k + 1 for k, u in enumerate(b["order"])}
+            n_b = len(b["order"])
+            d = sum(abs(math.log(pos_b.get(u, n_b + 1)) - math.log(ra)) for u, ra in pos_a.items()) / max(len(pos_a), 1)
+            total += d / math.sqrt(gap)
+            count += 1
+    return total / count if count else None
+
+
 def exit_hazard(rank, prm):
     if rank <= 10:
         return prm["exit_top"]
@@ -163,7 +240,7 @@ def exit_hazard(rank, prm):
     return prm["exit_low"]
 
 
-def slot_matrix(chart, vel, surge, h, prm):
+def slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands=()):
     """Games x places 1..C probabilities at horizon h hours (C = matrix_places), balanced by Sinkhorn.
 
     Column C+1 holds everything else: a rank below C or off the chart. Each game's row sums to 1; place k's column
@@ -172,8 +249,7 @@ def slot_matrix(chart, vel, surge, h, prm):
     n = len(chart)
     cols = min(n, int(prm["matrix_places"]))
     bounds = [math.log(k + 0.5) for k in range(1, cols + 1)]
-    sig = math.sqrt(prm["sigma0"] ** 2 + prm["sigma1"] ** 2 * h)
-    sig_w = sig * prm["tail_mult"]
+    sig_h = math.sqrt(prm["sigma0"] ** 2 + prm["sigma1"] ** 2 * h) * vol_mult
     tw = prm["tail_w"]
     tau = prm["momentum_tau"]
     drift_h = tau * (1.0 - math.exp(-h / tau)) if tau > 0 else h
@@ -182,7 +258,9 @@ def slot_matrix(chart, vel, surge, h, prm):
     for i, u in enumerate(chart):
         rank = i + 1
         s = max(-prm["surge_clip"], min(prm["surge_clip"], surge[u]))
-        mu = math.log(rank) + prm["momentum"] * vel[u] * drift_h - prm["surge_coef"] * s * surge_h
+        mu = math.log(rank) + (prm["momentum"] * vel[u] + prm["momentum2"] * vel2[u]) * drift_h - prm["surge_coef"] * s * surge_h
+        sig = sig_h * (rank / 5.0) ** prm["sigma_rank_pow"]
+        sig_w = sig * prm["tail_mult"]
         stay = math.exp(-exit_hazard(rank, prm) * h)
         prev = 0.0
         row = []
@@ -192,11 +270,22 @@ def slot_matrix(chart, vel, surge, h, prm):
             prev = c
         row.append(max(1.0 - sum(row), 1e-12))
         rows.append(row)
+    # Surging Top Playing Now games: on the chart by now with probability q, and then high up (a log-normal
+    # profile over the places around tpn_center); the rest of their row is "not on the chart yet".
+    if cands:
+        q = prm["tpn_p"] * (1.0 - math.exp(-h / prm["tpn_tau"]))
+        lc, wd = math.log(prm["tpn_center"]), prm["tpn_width"]
+        prof = [math.exp(-0.5 * ((math.log(k) - lc) / wd) ** 2) for k in range(1, cols + 1)]
+        sp = sum(prof)
+        for _ in cands:
+            row = [q * p / sp for p in prof]
+            row.append(max(1.0 - q, 1e-12))
+            rows.append(row)
     # Each place's mass for games new to the chart grows with the horizon and with the place.
     base = min(prm["entrant_rate"] * h, prm["entrant_cap"])
     ent = [min(base * ((k + 1) / 5.5) ** prm["entrant_slope"], 0.6) for k in range(cols)]
     col_t = [1.0 - e for e in ent]
-    col_t.append(max(n - sum(col_t), 1e-9))
+    col_t.append(max(len(rows) - sum(col_t), 1e-9))
     width = cols + 1
     for _ in range(int(prm["sinkhorn_iters"])):
         sums = [0.0] * width
@@ -231,19 +320,28 @@ def forecast(reads, task, prm=None):
     chart = last["order"]
     pos_list = positions(reads, last["t"] - prm["vel_window"] * 3600.0)
     vel = {u: velocity(pos_list, u, prm) for u in chart}
+    pos_list2 = positions(reads, last["t"] - prm["vel_window2"] * 3600.0)
+    vel2 = {u: velocity(pos_list2, u, prm) for u in chart} if prm["momentum2"] else {u: 0.0 for u in chart}
     surge = player_surge(reads, prm)
-    acc = [[0.0] * places for _ in chart]
+    vol_mult = 1.0
+    if prm["vol_alpha"]:
+        rv = realized_vol(reads, prm)
+        if rv:
+            vol_mult = min(max((rv / prm["vol_ref"]) ** prm["vol_alpha"], 0.6), 1.8)
+    cands = tpn_candidates(reads, prm)
+    games = list(chart) + [u for u, _ in cands]
+    acc = [[0.0] * places for _ in games]
     ent_acc = [0.0] * places
     for s in range(slots):
         h = max((t0 + s * slot_s + 120.0 - last["t"]) / 3600.0, 0.05)
-        m, ent = slot_matrix(chart, vel, surge, h, prm)
-        for g in range(len(chart)):
+        m, ent = slot_matrix(chart, vel, vel2, surge, vol_mult, h, prm, cands)
+        for g in range(len(games)):
             for k in range(min(places, len(m[g]))):
                 acc[g][k] += m[g][k] / slots
         for k in range(len(ent)):
             ent_acc[k] += ent[k] / slots
     spare = [u for r in reversed(reads[:-1]) for u in r["order"]]
-    return build_doc(chart, acc, places, spare)
+    return build_doc(games, acc, places, spare)
 
 
 def build_doc(chart, acc, places, spare=()):
