@@ -8,7 +8,8 @@ The model, per hourly slot of the window, then averaged over the slots (the best
 when one forecast is scored against every slot):
   1. Each game on the last read's chart gets a distribution over its future rank: its log rank drifts with its
      recent momentum (a damped trend) and spreads with the horizon (a two-scale normal mixture, heavy tailed).
-  2. Each game may leave the chart (a hazard by rank band); new games may enter (a mass per place).
+  2. Each game may leave the chart (a hazard by rank band); new games may enter (a mass per place). A top game's
+     exit is also a scenario of its own, in which every game below it moves up one place at once.
   3. The games-by-places matrix is balanced (Sinkhorn) so each place holds one game and each game one place.
   4. Every game of the last chart is named at every place, so the unnamed mass of a place is shared only by games
      that are new to the chart: that is the mass left for them.
@@ -22,16 +23,17 @@ from datetime import datetime, timezone
 
 PLACES = 10
 
-# Parameters (log-rank units, hours), tuned on rolling-origin backtests of the public archive's reads (every read as
-# the last of a history, scored on the reads of the next 24 hours), then hedged toward wider tails: a forecast too
-# sharp loses far more in a day the chart moves than one too wide loses in a quiet day.
+# Parameters (log-rank units, hours), tuned on rolling-origin backtests of the public archive's reads and of hourly
+# reads of the chart (every read as the last of a history, scored on the reads of the next 24 hours), then hedged
+# toward wider tails: a forecast too sharp loses far more in a day the chart moves than one too wide loses in a quiet
+# day.
 DEFAULTS = {
     "momentum": 0.25,  # share of the measured log-rank velocity carried forward (below the top 10)
     "momentum_tau": 17.5,  # hours: the velocity decays with this time constant
     "vel_window": 65.0,  # hours of history the velocity is measured over
     "vel_prior_n": 0.135,  # shrinkage of the velocity toward 0 (pseudo-reads)
     "sigma0": 0.0067,  # log-rank spread at horizon 0
-    "sigma1": 0.065,  # log-rank spread growth per sqrt(hour)
+    "sigma1": 0.062,  # log-rank spread growth per sqrt(hour)
     "tail_w": 0.11,  # weight of the wide component
     "tail_mult": 3.0,  # the wide component's spread, as a multiple
     "exit_top": 0.003,  # per-hour hazard of leaving the chart, ranks 1-10
@@ -59,6 +61,8 @@ DEFAULTS = {
     "tpn_tau": 8.0,  # hours: how fast that chance builds
     "tpn_center": 3.5,  # the place it most likely enters around
     "tpn_width": 0.8,  # log-place spread of where it enters
+    "cascade_w": 0.5,  # share of the top games' exit rate modelled as explicit dropouts that lift every game below (0: off)
+    "cascade_top": 10,  # the dropout scenarios cover the games now at ranks 1 to this
     "vol_alpha": 0.0,  # the spread scales with (realized volatility / vol_ref) ** this, between 0.6x and 1.8x (0: off)
     "vol_ref": 0.07,  # the archive's typical realized volatility (log rank per sqrt hour, top 20)
     "vol_window": 72.0,  # hours of history the realized volatility is measured over
@@ -331,7 +335,8 @@ def realized_vol(reads, prm):
 
 def exit_hazard(rank, prm):
     if rank <= 10:
-        return prm["exit_top"]
+        # The share of the top-10 exit rate that the dropout scenarios carry is not counted again here.
+        return prm["exit_top"] * (1.0 - (prm["cascade_w"] if rank <= prm["cascade_top"] else 0.0))
     if rank <= 40:
         return prm["exit_mid"]
     return prm["exit_low"]
@@ -410,6 +415,28 @@ def slot_matrix(chart, vel, surge, h, prm, cands=(), vol_mult=1.0):
     return out, ent[:top]
 
 
+def with_dropouts(chart, vel, surge, h, prm, cands, vol_mult, base):
+    """Mix in the dropout scenarios. A top game leaving the chart moves every game below it up one place, at once:
+    scenario e is the game at rank e (of the top cascade_top) gone by h hours, with probability
+    1 - exp(-cascade_w * exit_top * h) each, modelled by the same model run on the chart without that game."""
+    n = len(chart)
+    top_n = min(int(prm["cascade_top"]), n - 1)
+    if top_n <= 0:
+        return base
+    q = 1.0 - math.exp(-prm["cascade_w"] * prm["exit_top"] * h)
+    total = min(q * top_n, 0.9)
+    q = total / top_n
+    out = [[(1.0 - total) * v for v in row] for row in base]
+    for e in range(top_n):
+        sub = chart[:e] + chart[e + 1:]
+        m_e, _ = slot_matrix(sub, vel, surge, h, prm, cands, vol_mult)
+        for j, row in enumerate(m_e):
+            g = j if j < e else j + 1  # back to the full chart's rows (candidates follow the chart in both)
+            for k in range(min(len(row), len(out[g]))):
+                out[g][k] += q * row[k]
+    return out
+
+
 def forecast(reads, task, prm=None):
     prm = dict(DEFAULTS, **(prm or {}))
     places = int(task.get("places", PLACES))
@@ -436,6 +463,8 @@ def forecast(reads, task, prm=None):
     for s in range(slots):
         h = hours[s]
         m, ent = slot_matrix(chart, vel, surge, h, prm, cands, vol_mult)
+        if prm["cascade_w"] > 0:
+            m = with_dropouts(chart, vel, surge, h, prm, cands, vol_mult, m)
         # With probability frozen, no recompute has happened since the last read: the chart is exactly that read's.
         frozen = prm["freeze_w"] * still[s]
         for g in range(len(games)):

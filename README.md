@@ -17,8 +17,10 @@ hourly read with a log score.
   live player count, so the rank catches up within hours. The spread grows with the horizon, with a heavy-tailed
   second component.
 - **Exits and newcomers:** each game may leave the chart (a hazard by rank band), and each place keeps some mass for
-  games that are not on the chart yet. A game that just broke into the Top Playing Now top 20 with a player surge,
-  while off the trending chart, is named as a likely newcomer near the top.
+  games that are not on the chart yet. When a top-10 game leaves, every game below it moves up one place at once,
+  so part of the top-10 exit rate is modelled as explicit dropout scenarios: each is the same model run on the chart
+  without that game. A game that just broke into the Top Playing Now top 20 with a player surge, while off the
+  trending chart, is named as a likely newcomer near the top.
 - **One game per place:** the games-by-places matrix is balanced by Sinkhorn iterations, so each place holds one game
   and each game one place.
 - **One forecast for the whole window:** the hourly matrices are averaged over the 24 slots, which is the best single
@@ -26,8 +28,9 @@ hourly read with a log score.
 - **Naming:** every game of the last chart is named at every place, so a place's unnamed rest is shared only by the
   games that are new to the chart.
 
-The parameters were tuned on rolling-origin backtests of the public archive (every read as the last of a history,
-scored on the reads of the next 24 hours with the contest's scoring rule), then hedged toward wider tails.
+The parameters were tuned on rolling-origin backtests of the public archive and of hourly reads of the chart (every
+read as the last of a history, scored on the reads of the next 24 hours with the contest's scoring rule), then hedged
+toward wider tails.
 
 ## Licence
 
