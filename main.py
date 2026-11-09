@@ -55,6 +55,9 @@ DEFAULTS = {
     "tpn_tau": 8.0,  # hours: how fast that chance builds
     "tpn_center": 3.5,  # the place it most likely enters around
     "tpn_width": 0.8,  # log-place spread of where it enters
+    "vol_alpha": 0.0,  # the spread scales with (realized volatility / vol_ref) ** this, between 0.6x and 1.8x (0: off)
+    "vol_ref": 0.07,  # the archive's typical realized volatility (log rank per sqrt hour, top 20)
+    "vol_window": 72.0,  # hours of history the realized volatility is measured over
     "freeze_w": 0.0,  # weight of the frozen-chart component (0: off)
     "freeze_t0": 2.0,  # prior: P(still frozen after h hours) = exp(-(h / freeze_t0) ** freeze_k) ...
     "freeze_k": 1.0,  # ... memoryless, a recompute every 2 hours or so: fits both hourly reads and the archive
@@ -298,6 +301,30 @@ def frozen_curve(reads, hours, prm):
     return out
 
 
+def realized_vol(reads, prm):
+    """The chart's recent volatility: mean |change of log rank| per sqrt(hour) of the top 20 games, over pairs of
+    reads 3 to 12 hours apart within vol_window hours of the last read (None when no such pair)."""
+    last_t = reads[-1]["t"]
+    recent = [r for r in reads if last_t - r["t"] <= prm["vol_window"] * 3600.0]
+    total, count = 0.0, 0
+    for i, a in enumerate(recent):
+        pos_a = None
+        for b in recent[i + 1:]:
+            gap = (b["t"] - a["t"]) / 3600.0
+            if gap < 3.0:
+                continue
+            if gap > 12.0:
+                break
+            if pos_a is None:
+                pos_a = {u: k + 1 for k, u in enumerate(a["order"][:20])}
+            pos_b = {u: k + 1 for k, u in enumerate(b["order"])}
+            n_b = len(b["order"])
+            d = sum(abs(math.log(pos_b.get(u, n_b + 1)) - math.log(ra)) for u, ra in pos_a.items()) / max(len(pos_a), 1)
+            total += d / math.sqrt(gap)
+            count += 1
+    return total / count if count else None
+
+
 def exit_hazard(rank, prm):
     if rank <= 10:
         return prm["exit_top"]
@@ -306,7 +333,7 @@ def exit_hazard(rank, prm):
     return prm["exit_low"]
 
 
-def slot_matrix(chart, vel, surge, h, prm, cands=()):
+def slot_matrix(chart, vel, surge, h, prm, cands=(), vol_mult=1.0):
     """Games x places 1..C probabilities at horizon h hours (C = matrix_places), balanced by Sinkhorn.
 
     Column C+1 holds everything else: a rank below C or off the chart. Each game's row sums to 1; place k's column
@@ -315,7 +342,7 @@ def slot_matrix(chart, vel, surge, h, prm, cands=()):
     n = len(chart)
     cols = min(n, int(prm["matrix_places"]))
     bounds = [math.log(k + 0.5) for k in range(1, cols + 1)]
-    sig = math.sqrt(prm["sigma0"] ** 2 + prm["sigma1"] ** 2 * h)
+    sig = math.sqrt(prm["sigma0"] ** 2 + prm["sigma1"] ** 2 * h) * vol_mult
     sig_w = sig * prm["tail_mult"]
     tw = prm["tail_w"]
     tau = prm["momentum_tau"]
@@ -393,9 +420,14 @@ def forecast(reads, task, prm=None):
     ent_acc = [0.0] * places
     hours = [max((t0 + s * slot_s + 120.0 - last["t"]) / 3600.0, 0.05) for s in range(slots)]
     still = frozen_curve(reads, hours, prm) if prm["freeze_w"] > 0 else [0.0] * slots
+    vol_mult = 1.0
+    if prm["vol_alpha"]:
+        rv = realized_vol(reads, prm)
+        if rv:
+            vol_mult = min(max((rv / prm["vol_ref"]) ** prm["vol_alpha"], 0.6), 1.8)
     for s in range(slots):
         h = hours[s]
-        m, ent = slot_matrix(chart, vel, surge, h, prm, cands)
+        m, ent = slot_matrix(chart, vel, surge, h, prm, cands, vol_mult)
         # With probability frozen, no recompute has happened since the last read: the chart is exactly that read's.
         frozen = prm["freeze_w"] * still[s]
         for g in range(len(games)):
