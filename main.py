@@ -45,6 +45,10 @@ DEFAULTS = {
     "surge_from": 26.5,  # the surge's reference: reads this many hours ago (about the same hour yesterday) ...
     "surge_to": 17.8,  # ... to this many
     "surge_clip": 2.5,  # largest surge counted, either way
+    "surge_big": 1.0,  # extra log-rank climb per unit of surge above surge_big_from (0: off)
+    "surge_big_from": 1.0,  # where a surge counts as explosive (a log ratio of 1: 2.7 times the players)
+    "surge_big_tau": 6.0,  # hours for that extra climb to show
+    "surge_big_min_rank": 11,  # only for games at this rank or below (above it the rank has caught up)
     "momentum_top_mult": 0.4,  # momentum multiplier for games now in the top 10 (their moves barely trend)
     "tpn_max": 3,  # at most this many surging Top Playing Now games named as likely newcomers (0: none)
     "tpn_rank_max": 20,  # only from the list's top this many
@@ -354,6 +358,10 @@ def slot_matrix(chart, vel, surge, h, prm, cands=(), vol_mult=1.0):
         s = max(-prm["surge_clip"], min(prm["surge_clip"], surge[u]))
         mom = prm["momentum"] * (prm["momentum_top_mult"] if rank <= 10 else 1.0)
         mu = math.log(rank) + mom * vel[u] * drift_h - prm["surge_coef"] * s * surge_h
+        if prm["surge_big"] and s > prm["surge_big_from"] and rank >= prm["surge_big_min_rank"]:
+            # An explosive surge (players several times their level a day before) moves the rank further and faster;
+            # only for a game whose rank has not caught up yet (a game already near the top has nowhere to go).
+            mu -= prm["surge_big"] * (s - prm["surge_big_from"]) * (1.0 - math.exp(-h / prm["surge_big_tau"]))
         stay = math.exp(-exit_hazard(rank, prm) * h)
         prev = 0.0
         row = []

@@ -12,8 +12,10 @@ hourly read with a log score.
 - **Per game, per hour:** each game on the last chart gets a distribution over its future rank in log-rank space. The
   mean drifts with the game's measured momentum (a damped log-rank trend, weaker for games already in the top 10,
   whose moves barely trend) and with its player surge (players now against the same hours a day earlier, both
-  relative to the chart's median, which takes out the daily cycle). The spread grows with the horizon, with a
-  heavy-tailed second component.
+  relative to the chart's median, which takes out the daily cycle). An explosive surge, several times the players
+  of the day before, lifts a game outside the top 10 further and faster: the chart's daily-user measure lags the
+  live player count, so the rank catches up within hours. The spread grows with the horizon, with a heavy-tailed
+  second component.
 - **Exits and newcomers:** each game may leave the chart (a hazard by rank band), and each place keeps some mass for
   games that are not on the chart yet. A game that just broke into the Top Playing Now top 20 with a player surge,
   while off the trending chart, is named as a likely newcomer near the top.
